@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+build/
+dist/
+*.spec
+.venv/
+venv/
+test_out/
+test_input.*
+*.xlsx
+!example/*.xlsx
