@@ -3,6 +3,7 @@
 
 Вход: Excel-файл "сводный запрос" с колонками:
     Исполнитель | Роль | Киз | Boxcount_короба | Processcount_строки | Строк
+(также принимается формат "выработка": Киз | короба | сборка_строк | контроль_строк)
 
 Выход: на каждого сотрудника отдельный .xlsx с колонками формата "выработка":
     Исполнитель | Роль | Киз | короба | сборка_строк | контроль_строк | объём выполненных работ
@@ -10,6 +11,9 @@
 Логика:
   - строки с одинаковыми (Исполнитель, Роль) суммируются;
   - числовые колонки складываются;
+  - роли из EXCLUDED_ROLES полностью исключаются;
+  - для строк из DUPLICATE_RULES внизу добавляется дубль с новым названием
+    и тем же значением Киз (входит в ИТОГО);
   - "объём выполненных работ" = сумма всех числовых колонок строки;
   - сортировка по ФИО, затем по роли;
   - в конце файла каждого сотрудника добавляется итоговая строка "ИТОГО".
@@ -19,22 +23,30 @@ import os
 import re
 import pandas as pd
 
-# Сопоставление колонок входного файла -> выходного
-COLUMN_MAP = {
-    "Киз": "Киз",
-    "Boxcount_короба": "короба",
-    "Processcount_строки": "сборка_строк",
-    "Строк": "контроль_строк",
+# Для каждой итоговой колонки — возможные названия во входном файле
+COLUMN_ALIASES = {
+    "Киз": ["Киз"],
+    "короба": ["Boxcount_короба", "короба"],
+    "сборка_строк": ["Processcount_строки", "сборка_строк"],
+    "контроль_строк": ["Строк", "контроль_строк"],
 }
 NUMERIC_OUT = ["Киз", "короба", "сборка_строк", "контроль_строк"]
 OUT_COLUMNS = ["Исполнитель", "Роль"] + NUMERIC_OUT + ["объём выполненных работ"]
 
-# Роли (виды работ), которые полностью исключаются из результата:
-# такие строки не попадают в файлы и не учитываются в суммах/итогах.
+# Виды работ, которые полностью исключаются (нет в файлах и не в итогах)
 EXCLUDED_ROLES = {
     "ТСД Льгота с упак.МАРК.товар,сборка штук",
     "ТСД ХОЛОД 2 сборка штук",
 }
+
+# Правила дублирования: исходная работа -> название новой строки-дубля.
+# В дубль копируется значение колонки Киз из исходной строки (остальное 0).
+# Дубли добавляются внизу (перед ИТОГО) и входят в общий итог.
+DUPLICATE_RULES = [
+    ("Сборка и упаковка в Холодильнике", "упаковка холод"),
+    ("Сборка и упаковка на льготе", "упаковка марк"),
+]
+DUPLICATE_SOURCE_COLUMN = "Киз"
 
 
 def _norm(s: str) -> str:
@@ -43,6 +55,7 @@ def _norm(s: str) -> str:
 
 
 _EXCLUDED_NORM = {_norm(r) for r in EXCLUDED_ROLES}
+_DUPLICATE_NORM = [(_norm(src), dst) for src, dst in DUPLICATE_RULES]
 
 
 def _safe_filename(name: str) -> str:
@@ -57,16 +70,23 @@ def load_summary(path: str) -> pd.DataFrame:
     df = pd.read_excel(path)
     df.columns = [str(c).strip() for c in df.columns]
 
-    # Проверка обязательных колонок
-    required = ["Исполнитель", "Роль"] + list(COLUMN_MAP.keys())
-    missing = [c for c in required if c not in df.columns]
+    missing = [c for c in ["Исполнитель", "Роль"] if c not in df.columns]
+
+    rename_map = {}
+    for out_name, aliases in COLUMN_ALIASES.items():
+        found = next((a for a in aliases if a in df.columns), None)
+        if found is None:
+            missing.append(out_name + " (" + " / ".join(aliases) + ")")
+        else:
+            rename_map[found] = out_name
+
     if missing:
         raise ValueError(
             "В файле не найдены колонки: " + ", ".join(missing) +
             "\nНайдены: " + ", ".join(df.columns)
         )
 
-    df = df.rename(columns=COLUMN_MAP)
+    df = df.rename(columns=rename_map)
 
     # Убрать строки без ФИО или без роли (итоговые/пустые строки исходника)
     df = df[df["Исполнитель"].notna() & df["Роль"].notna()].copy()
@@ -95,13 +115,33 @@ def aggregate(df: pd.DataFrame) -> pd.DataFrame:
     return grouped[OUT_COLUMNS]
 
 
+def _add_duplicates(emp_df: pd.DataFrame, employee: str) -> pd.DataFrame:
+    """Добавить внизу строки-дубли по DUPLICATE_RULES (значение из Киз)."""
+    roles_norm = emp_df["Роль"].map(_norm)
+    extra = []
+    for src_norm, dst_name in _DUPLICATE_NORM:
+        match = emp_df[roles_norm == src_norm]
+        if match.empty:
+            continue
+        value = match[DUPLICATE_SOURCE_COLUMN].sum()
+        row = {c: 0 for c in NUMERIC_OUT}
+        row[DUPLICATE_SOURCE_COLUMN] = value
+        row["Исполнитель"] = employee
+        row["Роль"] = dst_name
+        row["объём выполненных работ"] = value
+        extra.append(row)
+    if not extra:
+        return emp_df
+    return pd.concat([emp_df, pd.DataFrame(extra)[OUT_COLUMNS]],
+                     ignore_index=True)
+
+
 def _write_employee_file(emp_df: pd.DataFrame, out_path: str):
     """Записать .xlsx одного сотрудника с итоговой строкой и форматированием."""
     from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 
     emp_df = emp_df.copy()
 
-    # Итоговая строка
     totals = {c: emp_df[c].sum() for c in NUMERIC_OUT + ["объём выполненных работ"]}
     totals["Исполнитель"] = "ИТОГО"
     totals["Роль"] = ""
@@ -131,7 +171,6 @@ def _write_employee_file(emp_df: pd.DataFrame, out_path: str):
             cell.fill = total_fill
             cell.font = Font(bold=True)
 
-        # Ширина колонок
         widths = [32, 42, 10, 10, 14, 16, 22]
         for i, w in enumerate(widths, start=1):
             ws.column_dimensions[chr(64 + i)].width = w
@@ -155,6 +194,7 @@ def process(input_path: str, output_dir: str, progress=None) -> list:
 
     for i, emp in enumerate(employees, start=1):
         emp_df = agg[agg["Исполнитель"] == emp].reset_index(drop=True)
+        emp_df = _add_duplicates(emp_df, emp)
         fname = _safe_filename(emp) + ".xlsx"
         out_path = os.path.join(output_dir, fname)
         _write_employee_file(emp_df, out_path)
